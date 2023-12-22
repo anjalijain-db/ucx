@@ -4,18 +4,22 @@ import sys
 import webbrowser
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.errors import NotFound
 
 from databricks.labs.ucx.account import AccountWorkspaces, WorkspaceInfo
 from databricks.labs.ucx.config import AccountConfig, ConnectConfig
 from databricks.labs.ucx.framework.crawlers import StatementExecutionBackend
 from databricks.labs.ucx.framework.tui import Prompts
-from databricks.labs.ucx.hive_metastore import TablesCrawler
+from databricks.labs.ucx.hive_metastore import ExternalLocations, TablesCrawler
 from databricks.labs.ucx.hive_metastore.mapping import TableMapping
 from databricks.labs.ucx.install import WorkspaceInstaller
 from databricks.labs.ucx.installer import InstallationManager
 
 logger = logging.getLogger("databricks.labs.ucx")
+
+CANT_FIND_UCX_MSG = (
+    "Couldn't find UCX configuration in the user's home folder. "
+    "Make sure the current user has configured and installed UCX."
+)
 
 
 def workflows():
@@ -47,18 +51,13 @@ def skip(schema: str, table: str | None = None):
         logger.error("--Schema is a required parameter.")
         return None
     ws = WorkspaceClient()
-    installation_manager = WorkspaceInstaller(ws)
-    logger.info("Fetching installation config.")
-    try:
-        warehouse_id = installation_manager._current_config.warehouse_id
-        sql_backend = StatementExecutionBackend(ws, warehouse_id)
-    except NotFound:
-        logger.error(
-            "Couldn't find UCX configuration in the user's home folder. "
-            "Make sure the current user has configured and installed UCX."
-        )
+    installation_manager = InstallationManager(ws)
+    installation = installation_manager.for_user(ws.current_user.me())
+    if not installation:
+        logger.error(CANT_FIND_UCX_MSG)
         return None
-
+    warehouse_id = installation.config.warehouse_id
+    sql_backend = StatementExecutionBackend(ws, warehouse_id)
     mapping = TableMapping(ws)
     if table:
         mapping.skip_table(sql_backend, schema, table)
@@ -90,6 +89,30 @@ def create_table_mapping():
     webbrowser.open(f"{ws.config.host}/#workspace{path}")
 
 
+def validate_external_locations():
+    ws = WorkspaceClient()
+    prompts = Prompts()
+    installation_manager = InstallationManager(ws)
+    installation = installation_manager.for_user(ws.current_user.me())
+    sql_backend = StatementExecutionBackend(ws, installation.config.warehouse_id)
+    location_crawler = ExternalLocations(ws, sql_backend, installation.config.inventory_database)
+    path = location_crawler.save_as_terraform_definitions_on_workspace(installation.path)
+    if path and prompts.confirm(f"external_locations.tf file written to {path}. Do you want to open it?"):
+        webbrowser.open(f"{ws.config.host}/#workspace{path}")
+
+
+def ensure_assessment_run():
+    ws = WorkspaceClient()
+    installation_manager = InstallationManager(ws)
+    installation = installation_manager.for_user(ws.current_user.me())
+    if not installation:
+        logger.error(CANT_FIND_UCX_MSG)
+        return None
+    else:
+        workspace_installer = WorkspaceInstaller(ws)
+        workspace_installer.validate_and_run("assessment")
+
+
 MAPPING = {
     "open-remote-config": open_remote_config,
     "installations": list_installations,
@@ -97,6 +120,8 @@ MAPPING = {
     "sync-workspace-info": sync_workspace_info,
     "manual-workspace-info": manual_workspace_info,
     "create-table-mapping": create_table_mapping,
+    "validate-external-locations": validate_external_locations,
+    "ensure-assessment-run": ensure_assessment_run,
     "skip": skip,
 }
 
